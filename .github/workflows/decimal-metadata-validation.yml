@@ -1,0 +1,92 @@
+name: Decimal metadata review validation
+
+on:
+  push:
+    branches: [validation/decimal-metadata-11341]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '1'
+      RAYON_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 893c33a04fbd998f1e5970618e23394ac795eb8d
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Install the pinned compiler and checks
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+      - name: Compare the exact regression and check the candidate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, re, subprocess
+
+          root = Path.cwd()
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'decimal-metadata-evidence'
+          evidence.mkdir()
+          baseline = Path(os.environ['RUNNER_TEMP']) / 'decimal-metadata-baseline'
+          source = Path('arrow-array/src/array/primitive_array.rs')
+          selector = 'array::primitive_array::tests::test_decimal_array_set_null_if_overflow_with_precision'
+          records = []
+
+          def run(label, argv, cwd=root, expected=0):
+              command = ['timeout', '--signal=TERM', '--kill-after=30s', '900s', *argv]
+              result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (evidence / (label + '.log')).write_text(result.stdout)
+              records.append({'label': label, 'argv': command, 'cwd': str(cwd), 'exit': result.returncode, 'expected': expected})
+              (evidence / 'commands.json').write_text(json.dumps(records, indent=2) + '\n')
+              print(label, result.returncode, result.stdout[-3000:], flush=True)
+              assert result.returncode == expected, label
+              return result.stdout
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          assert run('candidate-head', ['git', 'rev-parse', 'HEAD']).strip() == '893c33a04fbd998f1e5970618e23394ac795eb8d'
+          assert sha(root / source) == '772c74633c3fefa2ed00acce691802cd1e33578173539e9e8cf85af86b459742'
+          run('baseline-worktree', ['git', 'worktree', 'add', '--detach', str(baseline), '2c337d8fa918e87999a6738167a0ddab881c6016'])
+          text = (root / source).read_text()
+          needle = '        self.unary_opt::<_, T>(|v| T::is_valid_decimal_precision(v, precision).then_some(v))\n            .with_data_type(self.data_type().clone())'
+          assert text.count(needle) == 1
+          (baseline / source).write_text(text.replace(needle, needle.split('\n')[0]))
+          assert sha(baseline / source) == '76208249f91f062fdee75eb5c47a9e3fe527d59bb11a9debca36692f13a5aa57'
+          assert (root / 'Cargo.lock').read_bytes() == (baseline / 'Cargo.lock').read_bytes()
+          fixture = r'    #\[test\]\n    fn test_decimal_array_set_null_if_overflow_with_precision\(\) \{.*?\n    \}'
+          candidate_fixture = re.search(fixture, text, re.S).group()
+          assert re.search(fixture, (baseline / source).read_text(), re.S).group() == candidate_fixture
+          (evidence / 'source.json').write_text(json.dumps({'candidate': '893c33a04fbd998f1e5970618e23394ac795eb8d', 'baseline': '2c337d8fa918e87999a6738167a0ddab881c6016', 'candidate_sha256': sha(root / source), 'baseline_sha256': sha(baseline / source), 'fixture_sha256': hashlib.sha256(candidate_fixture.encode()).hexdigest(), 'lock_sha256': sha(root / 'Cargo.lock')}, indent=2) + '\n')
+          run('compiler', ['rustup', 'run', '1.98.1', 'rustc', '-vV'])
+          run('format', ['rustup', 'run', '1.98.1', 'cargo', 'fmt', '--all', '--', '--check'])
+          run('candidate-diff-check', ['git', 'diff', '--check'])
+          run('baseline-diff-check', ['git', 'diff', '--check'], cwd=baseline)
+          cargo = ['rustup', 'run', '1.98.1', 'cargo']
+          baseline_target = str(Path(os.environ['RUNNER_TEMP']) / 'target-baseline')
+          candidate_target = str(Path(os.environ['RUNNER_TEMP']) / 'target-candidate')
+          baseline_log = run('baseline-regression', [*cargo, 'test', '--locked', '--target-dir', baseline_target, '-p', 'arrow-array', '--lib', '--all-features', selector, '--', '--exact', '--nocapture', '--test-threads=1'], cwd=baseline, expected=101)
+          assert 'running 1 test' in baseline_log and '0 passed; 1 failed' in baseline_log
+          assert 'left == right' in baseline_log and re.search(r'Decimal128\(38,\s*10\)', baseline_log) and re.search(r'Decimal128\(6,\s*2\)', baseline_log)
+          candidate_log = run('candidate-regression', [*cargo, 'test', '--locked', '--target-dir', candidate_target, '-p', 'arrow-array', '--lib', '--all-features', selector, '--', '--exact', '--nocapture', '--test-threads=1'])
+          assert 'running 1 test' in candidate_log and '1 passed; 0 failed' in candidate_log
+          run('all-features', [*cargo, 'test', '--locked', '--target-dir', candidate_target, '-p', 'arrow-array', '--all-features', '--', '--test-threads=1'])
+          run('ffi', [*cargo, 'test', '--locked', '--target-dir', candidate_target, '-p', 'arrow-array', '--features', 'ffi', '--', '--test-threads=1'])
+          run('release', [*cargo, 'test', '--locked', '--target-dir', candidate_target, '-p', 'arrow-array', '--lib', '--tests', '--release', '--', '--test-threads=1'])
+          run('clippy', [*cargo, 'clippy', '--locked', '--target-dir', candidate_target, '-p', 'arrow-array', '--all-targets', '--all-features', '--', '-D', 'warnings'])
+          assert sha(root / source) == '772c74633c3fefa2ed00acce691802cd1e33578173539e9e8cf85af86b459742'
+          assert sha(root / 'Cargo.lock') == json.loads((evidence / 'source.json').read_text())['lock_sha256']
+          (evidence / 'complete.json').write_text(json.dumps({'complete': True, 'commands': len(records)}) + '\n')
+          PY
+      - name: Retain commands and first errors
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: decimal-metadata-11341
+          path: ${{ runner.temp }}/decimal-metadata-evidence
+          if-no-files-found: error
